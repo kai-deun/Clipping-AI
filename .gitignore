@@ -1,0 +1,8 @@
+whisperx-src/
+venv/
+__pycache__/
+*.pyc
+clips/
+downloaded_videos/
+uploads/
+import_error.log

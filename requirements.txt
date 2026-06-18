@@ -1,0 +1,14 @@
+yt-dlp
+imageio-ffmpeg
+moviepy
+opencv-python
+python-magic-bin
+clipsai
+./whisperx-src
+fastapi
+uvicorn
+jinja2
+python-multipart
+edge-tts
+torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+whisperx
