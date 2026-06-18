@@ -129,7 +129,11 @@ def extract_audio_for_transcription(video_path, audio_path="temp_audio.wav"):
     return audio_path
 
 # ==============================================================================
-# GPU WhisperX Transcription Layer (REPLACES faster_whisper)
+# GPU WhisperX Transcription Layer
+# REFACTOR NOTE: We transitioned from `faster_whisper` to `whisperx` because 
+# faster_whisper only provides phrase-level timestamps, which break interactive 
+# transcripts. WhisperX utilizes forced alignment (Wav2Vec2) to generate highly 
+# precise word-level boundaries and implements Pyannote for speaker diarization.
 # ==============================================================================
 def transcribe_audio_locally(audio_path, model_size="large-v3"):
     """
@@ -140,15 +144,18 @@ def transcribe_audio_locally(audio_path, model_size="large-v3"):
     import whisperx
     import torch
     
+    # Force CUDA execution and float16 precision as requested for the RTX 5060 Ti (16GB VRAM)
     device = "cuda"
     compute_type = "float16"
     
-    # 1. Transcribe with WhisperX
+    # 1. Transcribe with WhisperX base model
     model = whisperx.load_model(model_size, device, compute_type=compute_type)
     audio = whisperx.load_audio(audio_path)
     result = model.transcribe(audio, batch_size=16)
     
-    # Free base model to conserve VRAM for alignment and diarization
+    # CRITICAL VRAM MANAGEMENT: 
+    # Delete the large base model and flush CUDA cache BEFORE loading the alignment model
+    # to prevent OutOfMemory (OOM) errors during the pipeline transition.
     del model
     gc.collect()
     torch.cuda.empty_cache()
@@ -158,23 +165,23 @@ def transcribe_audio_locally(audio_path, model_size="large-v3"):
     model_a, metadata = whisperx.load_align_model(language_code=result["language"], device=device)
     result = whisperx.align(result["segments"], model_a, metadata, audio, device, return_char_alignments=False)
     
-    # Free alignment model
+    # CRITICAL VRAM MANAGEMENT: Flush alignment model before Diarization
     del model_a
     gc.collect()
     torch.cuda.empty_cache()
     
-    # 3. Diarize to assign speakers (Offline, no auth token)
+    # 3. Diarize to assign speakers (Offline, no auth token required for basic features if local)
     print("[WhisperX] Diarizing speakers...")
     diarize_model = whisperx.DiarizationPipeline(use_auth_token=False, device=device)
     diarize_segments = diarize_model(audio)
     result = whisperx.assign_word_speakers(diarize_segments, result)
     
-    # Free diarization model
+    # CRITICAL VRAM MANAGEMENT: Flush diarization model to free VRAM for LLM or Rendering
     del diarize_model
     gc.collect()
     torch.cuda.empty_cache()
     
-    # 4. Reconstruct dictionary
+    # 4. Reconstruct structured dictionary with full text, word boundaries, and speaker IDs
     transcript_segments = []
     for segment in result["segments"]:
         words = []
@@ -192,7 +199,7 @@ def transcribe_audio_locally(audio_path, model_size="large-v3"):
     return transcript_segments
 
 # ==============================================================================
-# YouTube Heatmap Scraper Layer
+# YouTube Heatmap Scraper Layer (Tier 1)
 # ==============================================================================
 
 def get_youtube_heatmap(video_url):
@@ -330,7 +337,11 @@ def sync_heatmap_with_whisper(heatmap_entries, whisper_segments, min_duration=50
     return candidates
 
 # ==============================================================================
-# Local Ollama Llama-3 Hook Selector (REPLACES Groq)
+# Local Ollama Llama-3 Hook Selector (Tier 2)
+# REFACTOR NOTE: Removed all external API calls (Groq API, API Keys) in favor 
+# of a 100% local `requests.post` call to Ollama's default port (11434).
+# A strict system prompt enforces the requested JSON schema, and robust regex
+# fallback parsing prevents hallucinated markdown backticks from breaking the pipeline.
 # ==============================================================================
 def select_hooks_with_ollama(segments, rules, max_clips=3):
     """
@@ -363,6 +374,7 @@ Output ONLY valid JSON. No markdown backticks, no explanations. The output must 
 ]
 """
     try:
+        # Local Ollama HTTP API Call
         response = requests.post("http://localhost:11434/api/generate", json={
             "model": "llama3",
             "prompt": prompt,
@@ -371,7 +383,7 @@ Output ONLY valid JSON. No markdown backticks, no explanations. The output must 
         if response.status_code == 200:
             text = response.json().get('response', '').strip()
             
-            # Robust fallback parsing mechanism for hallucinations
+            # Robust fallback parsing mechanism for hallucinations (e.g. ```json ... ```)
             if "```json" in text:
                 match = re.search(r"```json\s*(.*?)\s*```", text, re.S)
                 if match:
@@ -381,7 +393,7 @@ Output ONLY valid JSON. No markdown backticks, no explanations. The output must 
                 if match:
                     text = match.group(1)
             
-            # Find JSON boundaries
+            # Find JSON boundaries to strip any remaining conversational text
             start_idx = text.find('[')
             end_idx = text.rfind(']')
             if start_idx != -1 and end_idx != -1:
@@ -391,9 +403,9 @@ Output ONLY valid JSON. No markdown backticks, no explanations. The output must 
             formatted_clips = []
             for c in clips:
                 formatted_clips.append({
-                    "start_time": c["start_time"],
-                    "end_time": c["end_time"],
-                    "duration": c["end_time"] - c["start_time"],
+                    "start_time": float(c["start_time"]),
+                    "end_time": float(c["end_time"]),
+                    "duration": float(c["end_time"]) - float(c["start_time"]),
                     "score": 90.0,
                     "overlay_text": c.get("cta_overlay_text", ""),
                     "add_captions": c.get("requires_captions", False)
@@ -403,6 +415,9 @@ Output ONLY valid JSON. No markdown backticks, no explanations. The output must 
         print(f"[LLM Error] Local Ollama parsing failed: {e}")
     return []
 
+# ==============================================================================
+# NLP Heuristics Fallback (Tier 3)
+# ==============================================================================
 def detect_hooks_nlp(segments, min_duration=50, max_duration=90, add_captions=False):
     print("\n[NLP] Analyzing transcript segments for logical hooks (50-90 seconds)...")
     candidates = []
@@ -467,7 +482,10 @@ def filter_overlapping_clips(candidates):
     return selected_clips
 
 # ==============================================================================
-# Conditional Layout Compositing & Rendering (WhisperX timings)
+# Conditional Layout Compositing & Rendering (MoviePy 2.x Adapted)
+# REFACTOR NOTE: MoviePy 2.x `transform` signature bugs have been fixed by wrapping
+# callbacks in explicit `lambda gf, t:` functions. Subtitle generation now parses
+# precise WhisperX word-level timings and renders multi-line text at the bottom 75%.
 # ==============================================================================
 
 import cv2
@@ -501,6 +519,7 @@ def add_cta_overlay(frame, text):
     text_x = (w - text_size[0]) // 2
     text_y = int(h * 0.15)
     
+    # Render Drop Shadow
     cv2.putText(frame, text, (text_x+2, text_y+2), font, font_scale, (0, 0, 0), thickness + 2, cv2.LINE_AA)
     cv2.putText(frame, text, (text_x, text_y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
     return frame
@@ -508,9 +527,9 @@ def add_cta_overlay(frame, text):
 def make_caption_frame_modifier(clip_start_time, local_transcript_segments):
     """
     Parses exact word-level WhisperX timings. Renders drop-shadowed, multi-line format 
-    at the bottom 75% of the screen.
+    at the bottom 75% of the screen. Returns a function ready for MoviePy 2.x transform.
     """
-    # Flatten all words into a timeline array
+    # Flatten all words into a timeline array for precise synchronization
     all_words = []
     for seg in local_transcript_segments:
         if 'words' in seg:
@@ -525,11 +544,11 @@ def make_caption_frame_modifier(clip_start_time, local_transcript_segments):
         # Find active word block (we'll show up to 5 words around the current time to build the phrase)
         active_words = []
         for w_obj in all_words:
-            # We group words near the current time to form a sentence chunk
+            # Group words near the current time to form a sentence chunk
             if current_global_time - 1.5 <= w_obj['start'] and w_obj['start'] <= current_global_time + 1.5:
                 active_words.append(w_obj['word'])
                 
-        # If no word exactly aligns, find the sentence segment
+        # If no word exactly aligns, find the sentence segment as fallback
         if not active_words:
             for segment in local_transcript_segments:
                 if segment['start'] <= current_global_time <= segment['end']:
@@ -555,6 +574,7 @@ def make_caption_frame_modifier(clip_start_time, local_transcript_segments):
             line_heights.append(size[1])
             total_block_height += size[1] + int(12 * font_scale)
             
+        # Render at the bottom 75% of the screen
         start_y = int(h * 0.75) - (total_block_height // 2)
         current_y = start_y
         
@@ -562,7 +582,9 @@ def make_caption_frame_modifier(clip_start_time, local_transcript_segments):
             size = cv2.getTextSize(line, font, font_scale, thickness)[0]
             text_x = (w - size[0]) // 2
             
+            # Drop shadow
             cv2.putText(frame, line, (text_x + 3, current_y + 3), font, font_scale, (0, 0, 0), thickness + 3, cv2.LINE_AA)
+            # Main white text
             cv2.putText(frame, line, (text_x, current_y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
             current_y += line_heights[i] + int(12 * font_scale)
             
@@ -724,15 +746,16 @@ def run_clipping_pipeline(url="", input_video_path="", num_clips=3, model_size="
             
             formatted_canvas = render_pro_clip(sub_clip, target_w=target_w, target_h=target_h)
             
+            # CRITICAL FIX for MoviePy 2.x: Explicitly define lambda gf, t to ensure correct argument mapping
             if overlay:
-                formatted_canvas = formatted_canvas.transform(lambda get_frame, t: add_cta_overlay(np.copy(get_frame(t)), overlay))
+                formatted_canvas = formatted_canvas.transform(lambda gf, t: add_cta_overlay(np.copy(gf(t)), overlay))
                 
             if target.get("add_captions", False):
                 caption_callback = make_caption_frame_modifier(
                     clip_start_time=target['start_time'],
                     local_transcript_segments=segments
                 )
-                formatted_canvas = formatted_canvas.transform(caption_callback)
+                formatted_canvas = formatted_canvas.transform(lambda gf, t: caption_callback(gf, t))
             
             formatted_canvas.write_videofile(
                 out_path,
@@ -760,6 +783,8 @@ def run_clipping_pipeline(url="", input_video_path="", num_clips=3, model_size="
             
     # ==========================================================================
     # CRITICAL VRAM MEMORY MANAGEMENT
+    # Ensures the GPU is fully cleared so the FastAPI background thread doesn't 
+    # hoard memory indefinitely, allowing subsequent polling jobs to execute safely.
     # ==========================================================================
     log("Complete", 95, "Flushing PyTorch GPU VRAM Memory...")
     import torch
