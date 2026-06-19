@@ -10,5 +10,6 @@ jinja2
 python-multipart
 requests
 edge-tts
-torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-whisperx
+faster-whisper
+nvidia-cublas-cu12
+nvidia-cudnn-cu12

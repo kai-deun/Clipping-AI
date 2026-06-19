@@ -1,8 +1,10 @@
-whisperx-src/
+dependencies/whisperx-src/
 venv/
 __pycache__/
 *.pyc
-clips/
-downloaded_videos/
-uploads/
+media/clips/
+media/downloaded_videos/
+media/uploads/
 import_error.log
+*.wav
+temp_audio.wav
